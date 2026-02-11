@@ -16,6 +16,16 @@ import cv2
 import numpy as np
 import threading
 
+# NumPy 2.x 兼容性补丁：为已弃用的 np.int 提供兼容别名
+try:
+    if not hasattr(np, 'int'):
+        np.int = np.int64
+        np.float = np.float64
+        np.bool = np.bool_
+        logging.getLogger(__name__).info("已为 NumPy 2.x 添加兼容别名（np.int -> np.int64 等）")
+except Exception:
+    pass
+
 try:
     from paddleocr import PaddleOCR
 except Exception as e:
