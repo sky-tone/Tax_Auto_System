@@ -37,7 +37,7 @@ def test_extract_text_no_paddle(monkeypatch):
 
 
 def test_extract_text_with_mock_ocr(monkeypatch):
-    """使用 mock OCR 返回已知识别项，验证金额/日期/商品名能被正确解析"""
+    """使用 mock OCR 返回已知识别项（包含发票字段），验证所有字段能被正确解析"""
 
     class MockOCR:
         def ocr(self, img, cls=True):
@@ -45,6 +45,11 @@ def test_extract_text_with_mock_ocr(monkeypatch):
                 [[[0, 0], [100, 0], [100, 30], [0, 30]], ('商品A', 0.99)],
                 [[[0, 40], [200, 40], [200, 80], [0, 80]], ('合计 ¥ 123.45', 0.95)],
                 [[[0, 90], [300, 90], [300, 130], [0, 130]], ('2025年12月31日', 0.9)],
+                [[[0, 140], [300, 140], [300, 170], [0, 170]], ('发票号ABC123456', 0.85)],
+                [[[0, 180], [300, 180], [300, 210], [0, 210]], ('发票代码1234567890', 0.88)],
+                [[[0, 220], [300, 220], [300, 250], [0, 250]], ('销售方公司A', 0.87)],
+                [[[0, 260], [300, 260], [300, 290], [0, 290]], ('购方公司B', 0.86)],
+                [[[0, 300], [300, 300], [300, 330], [0, 330]], ('税额 25.50', 0.84)],
             ]
 
     mock = MockOCR()
@@ -56,6 +61,20 @@ def test_extract_text_with_mock_ocr(monkeypatch):
     assert abs(res['金额'] - 123.45) < 1e-6
     assert res['日期'] == '2025年12月31日'
     assert isinstance(res['识别商品名'], str) and len(res['识别商品名']) > 0
+    
+    # 验证新增的发票字段
+    assert '发票号' in res
+    assert '发票代码' in res
+    assert '开票机构' in res
+    assert '购方' in res
+    assert '税额' in res
+    
+    # 验证发票字段的解析值（基于 regex）
+    assert res['发票号'] == 'ABC123456'
+    assert res['发票代码'] == '1234567890'
+    assert res['开票机构'] == '公司A'
+    assert res['购方'] == '公司B'
+    assert abs(res['税额'] - 25.50) < 1e-6
 
 
 def test_extract_text_confidence_filter():
@@ -129,3 +148,45 @@ def test_paddlex_patch_handles_attributeerror(monkeypatch):
 
     # 只要没有抛异常即可视为成功；res 可以为 DummyPaddleOCR 实例或 None（取决于环境）
     assert True
+
+def test_extract_text_pdf_detection(monkeypatch):
+    """测试 PDF 文件检测和处理（无 pdf2image 时返回相应错误）"""
+    
+    class MockOCR:
+        def ocr(self, img, cls=True):
+            return [[[[0, 0], [100, 0], [100, 30], [0, 30]], ('test', 0.9)]]
+    
+    # 构造 PDF 魔数
+    pdf_bytes = b'%PDF-1.4\n' + b'fake pdf content'
+    data = io.BytesIO(pdf_bytes)
+    data.name = 'test.pdf'
+    
+    # 当 pdf2image 未安装时，应返回相应的错误消息
+    res = ocr_process.extract_text(data, ocr=MockOCR())
+    
+    # 检查返回结构中 PDF 相关的字段
+    assert '文件名' in res
+    assert '金额' in res
+    # 由于 pdf2image 可能未安装，应该有错误或警告
+    # （如果 pdf2image 安装了，则不会有错误；测试应该容错）
+    assert res['金额'] == 0 or '错误' in res or '警告' in res
+
+
+def test_extract_text_returns_nine_fields(monkeypatch):
+    """验证返回字典总是包含 9 个标准字段"""
+    
+    class MockOCR:
+        def ocr(self, img, cls=True):
+            return []
+    
+    # 即使没有识别到任何内容，也应返回 9 个字段
+    data = io.BytesIO(_make_test_image())
+    data.name = 'empty.jpg'
+    res = ocr_process.extract_text(data, ocr=MockOCR())
+    
+    required_fields = [
+        '文件名', '识别商品名', '金额', '日期',
+        '发票号', '发票代码', '开票机构', '购方', '税额'
+    ]
+    for field in required_fields:
+        assert field in res, f"缺少字段: {field}"

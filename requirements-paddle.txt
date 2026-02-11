@@ -10,5 +10,10 @@ opencv-python
 paddlepaddle>=2.5.0
 paddleocr>=2.5.0
 
+# PDF 支持（可选）
+pdf2image
+Pillow
+
 # If you need GPU support, replace `paddlepaddle` with the appropriate GPU wheel
 # from Paddle's official instructions (not listed here because it varies by CUDA).
+

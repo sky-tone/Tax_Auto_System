@@ -197,6 +197,13 @@ DATE_RE = re.compile(r"(\d{4}年\d{1,2}月\d{1,2}日)")
 ALT_DATE_RE = re.compile(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})")
 NUM_RE = re.compile(r"(\d+[\d,]*\.?\d*)")
 
+# 发票特定字段识别
+INVOICE_NUMBER_RE = re.compile(r"(?:发票号|发票代码|号码|No\.?)[\s：:]*([A-Z0-9\-]{6,30})")
+INVOICE_CODE_RE = re.compile(r"(?:发票代码)[\s：:]*([0-9]{10,15})")
+SELLER_RE = re.compile(r"(?:销售方|卖方|开票人|开票机构)[\s：:]*(.{2,20})")
+BUYER_RE = re.compile(r"(?:购买方|买方|购方)[\s：:]*(.{2,20})")
+TAX_RE = re.compile(r"(?:税额|税|税率)[\s：:]*([0-9]+(?:\.[0-9]+)?)")
+
 
 def _bbox_center(bbox):
     xs = [p[0] for p in bbox]
@@ -228,40 +235,163 @@ def _parse_amount_from_text(text: str) -> Optional[float]:
 
 
 def extract_text(image_file, ocr=None, conf_threshold: float = 0.0) -> Dict[str, Any]:
-    """读取图片并使用 PaddleOCR（或传入的 ocr 实例）识别，返回解析结果字典。
+    """读取图片或 PDF 并使用 PaddleOCR 识别，返回解析结果字典。
 
-    支持三种输入：类文件对象（带 .read()，可含 .name）、bytes/bytearray、或文件路径字符串。
+    支持输入：
+    - 类文件对象（带 .read()，可含 .name）
+    - bytes/bytearray
+    - 文件路径字符串
+    - PDF 文件（多页返回单个列表，仅处理第一页）
+    
     若未传入 `ocr`，函数会尝试通过 `get_ocr()` 懒加载 PaddleOCR；若 PaddleOCR 未安装，返回包含 `错误` 的结果。
     """
     filename = getattr(image_file, 'name', 'uploaded_image')
+    is_pdf = False
+    img = None
 
-    # 选择 OCR 实例：优先使用传入的 ocr（用于测试），否则尝试懒初始化
+    # 检测是否为 PDF
+    if hasattr(image_file, 'name') and filename.lower().endswith('.pdf'):
+        is_pdf = True
+    elif isinstance(image_file, str) and image_file.lower().endswith('.pdf'):
+        is_pdf = True
+    elif isinstance(image_file, (bytes, bytearray)):
+        # 检查 PDF 魔数
+        if image_file[:4] == b'%PDF':
+            is_pdf = True
+            filename = filename or 'uploaded.pdf'
+
+    # 如果是 PDF，转换为图片
+    if is_pdf:
+        try:
+            from pdf2image import convert_from_bytes
+            image_bytes = image_file.read() if hasattr(image_file, 'read') else (
+                bytes(image_file) if isinstance(image_file, (bytes, bytearray)) else
+                open(image_file, 'rb').read()
+            )
+            # 仅处理第一页
+            pages = convert_from_bytes(image_bytes, first_page=1, last_page=1)
+            if not pages:
+                return {
+                    "文件名": filename,
+                    "识别商品名": None,
+                    "金额": 0,
+                    "日期": None,
+                    "发票号": None,
+                    "发票代码": None,
+                    "开票机构": None,
+                    "购方": None,
+                    "税额": None,
+                    "错误": "PDF 页面提取失败"
+                }
+            # 转换 PIL Image 为 OpenCV 格式
+            img = cv2.cvtColor(np.array(pages[0]), cv2.COLOR_RGB2BGR)
+        except ImportError:
+            return {
+                "文件名": filename,
+                "识别商品名": None,
+                "金额": 0,
+                "日期": None,
+                "发票号": None,
+                "发票代码": None,
+                "开票机构": None,
+                "购方": None,
+                "税额": None,
+                "错误": "PDF 支持需要 pdf2image 库，请运行：pip install pdf2image"
+            }
+        except Exception as e:
+            logging.getLogger(__name__).exception('PDF 转换失败：%s', e)
+            return {
+                "文件名": filename,
+                "识别商品名": None,
+                "金额": 0,
+                "日期": None,
+                "发票号": None,
+                "发票代码": None,
+                "开票机构": None,
+                "购方": None,
+                "税额": None,
+                "错误": f"PDF 处理失败：{str(e)}"
+            }
+    else:
+        # 处理常规图片文件
+        try:
+            # 读取 bytes
+            if hasattr(image_file, 'read'):
+                image_bytes = image_file.read()
+            elif isinstance(image_file, (bytes, bytearray)):
+                image_bytes = bytes(image_file)
+            else:
+                with open(image_file, 'rb') as f:
+                    image_bytes = f.read()
+
+            if not image_bytes:
+                raise ValueError('空的图片数据')
+
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                # 检查是否使用 Mock OCR（稍后会检查）
+                return {
+                    "文件名": filename,
+                    "识别商品名": None,
+                    "金额": 0,
+                    "日期": None,
+                    "发票号": None,
+                    "发票代码": None,
+                    "开票机构": None,
+                    "购方": None,
+                    "税额": None,
+                    "错误": "无法解码图片"
+                }
+        except Exception as e:
+            logging.getLogger(__name__).exception('图片读取失败：%s', e)
+            return {
+                "文件名": filename,
+                "识别商品名": None,
+                "金额": 0,
+                "日期": None,
+                "发票号": None,
+                "发票代码": None,
+                "开票机构": None,
+                "购方": None,
+                "税额": None,
+                "错误": str(e)
+            }
+    
+    # 确保有图像数据（来自 PDF 或常规图片）
+    if img is None:
+        return {
+            "文件名": filename,
+            "识别商品名": None,
+            "金额": 0,
+            "日期": None,
+            "发票号": None,
+            "发票代码": None,
+            "开票机构": None,
+            "购方": None,
+            "税额": None,
+            "错误": "无法获取图像数据"
+        }
+
+    # 获取 OCR 实例
     local_ocr = ocr or get_ocr()
     is_mock = getattr(local_ocr, 'is_mock', False) if local_ocr is not None else False
 
     if local_ocr is None:
-        return {"文件名": filename, "识别商品名": None, "金额": 0, "日期": None, "错误": "PaddleOCR 未安装或未初始化"}
+        return {
+            "文件名": filename,
+            "识别商品名": None,
+            "金额": 0,
+            "日期": None,
+            "发票号": None,
+            "发票代码": None,
+            "开票机构": None,
+            "购方": None,
+            "税额": None,
+            "错误": "PaddleOCR 未安装或未初始化"
+        }
 
     try:
-        # 读取 bytes
-        if hasattr(image_file, 'read'):
-            image_bytes = image_file.read()
-        elif isinstance(image_file, (bytes, bytearray)):
-            image_bytes = bytes(image_file)
-        else:
-            with open(image_file, 'rb') as f:
-                image_bytes = f.read()
-
-        if not image_bytes:
-            raise ValueError('空的图片数据')
-
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            if is_mock:
-                return {"文件名": filename, "识别商品名": None, "金额": 0, "日期": None, "警告": "使用 MockOCR；图片解码失败"}
-            raise ValueError('无法解码图片')
-
         raw = local_ocr.ocr(img, cls=True)
 
         entries = []
@@ -334,11 +464,65 @@ def extract_text(image_file, ocr=None, conf_threshold: float = 0.0) -> Dict[str,
         if found_amount is None:
             found_amount = 0
 
-        out = {'文件名': filename, '识别商品名': product_name, '金额': found_amount, '日期': found_date}
+        # 提取发票特定字段
+        invoice_number = None
+        invoice_code = None
+        seller = None
+        buyer = None
+        tax_amount = None
+        
+        for e in entries:
+            text = e['text']
+            if not invoice_number:
+                m = INVOICE_NUMBER_RE.search(text)
+                if m:
+                    invoice_number = m.group(1)
+            if not invoice_code:
+                m = INVOICE_CODE_RE.search(text)
+                if m:
+                    invoice_code = m.group(1)
+            if not seller:
+                m = SELLER_RE.search(text)
+                if m:
+                    seller = m.group(1)
+            if not buyer:
+                m = BUYER_RE.search(text)
+                if m:
+                    buyer = m.group(1)
+            if not tax_amount:
+                m = TAX_RE.search(text)
+                if m:
+                    try:
+                        tax_amount = float(m.group(1))
+                    except Exception:
+                        pass
+
+        out = {
+            '文件名': filename,
+            '识别商品名': product_name,
+            '金额': found_amount,
+            '日期': found_date,
+            '发票号': invoice_number,
+            '发票代码': invoice_code,
+            '开票机构': seller,
+            '购方': buyer,
+            '税额': tax_amount,
+        }
         if is_mock:
             out['警告'] = 'OCR 使用 Mock 回退；结果仅供调试'
         return out
 
     except Exception as e:
         logging.getLogger(__name__).exception('OCR 识别失败：%s', e)
-        return {"文件名": filename, "识别商品名": None, "金额": 0, "日期": None, "错误": str(e)}
+        return {
+            "文件名": filename,
+            "识别商品名": None,
+            "金额": 0,
+            "日期": None,
+            "发票号": None,
+            "发票代码": None,
+            "开票机构": None,
+            "购方": None,
+            "税额": None,
+            "错误": str(e)
+        }
