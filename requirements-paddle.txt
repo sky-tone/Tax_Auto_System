@@ -1,0 +1,14 @@
+# Optional, heavy dependencies for running real PaddleOCR integration tests locally or in CI.
+# NOTE: Paddle / PaddleOCR are large and may require specific CUDA/OS support.
+# Recommend pinning versions that are compatible with your environment. If you see
+# `np.sctypes` errors, install `numpy<2.0` or upgrade paddle/paddleocr to a version
+# compatible with NumPy 2.x.
+
+# Example CPU-only install (adjust for GPU as needed):
+numpy<2.0
+opencv-python
+paddlepaddle>=2.5.0
+paddleocr>=2.5.0
+
+# If you need GPU support, replace `paddlepaddle` with the appropriate GPU wheel
+# from Paddle's official instructions (not listed here because it varies by CUDA).
