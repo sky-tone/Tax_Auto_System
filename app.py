@@ -41,7 +41,7 @@ if uploaded_files:
         display_cols = [
             '文件名', '识别商品名', '金额', '日期',
             '发票号', '发票代码', '开票机构', '购方', '税额',
-            '会计科目'
+            '会计科目', '错误', '警告'
         ]
         display_df = df[[col for col in display_cols if col in df.columns]]
         st.dataframe(display_df, use_container_width=True)

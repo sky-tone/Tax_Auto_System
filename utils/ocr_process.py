@@ -192,17 +192,27 @@ def get_ocr(try_init: bool = True, **init_kwargs) -> Optional[object]:
     return o
 
 
-AMOUNT_RE = re.compile(r"(?:金额|合计|总计|小计|¥|￥)?\s*([0-9]+(?:[\,\d]*\d)?(?:\.\d+)?)")
+AMOUNT_RE = re.compile(r"(?:金额|价税合计|合计|总计|小计|¥|￥)?\s*([0-9]+(?:[\,\d]*\d)?(?:\.\d+)?)")
 DATE_RE = re.compile(r"(\d{4}年\d{1,2}月\d{1,2}日)")
 ALT_DATE_RE = re.compile(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})")
 NUM_RE = re.compile(r"(\d+[\d,]*\.?\d*)")
 
 # 发票特定字段识别
-INVOICE_NUMBER_RE = re.compile(r"(?:发票号|发票代码|号码|No\.?)[\s：:]*([A-Z0-9\-]{6,30})")
-INVOICE_CODE_RE = re.compile(r"(?:发票代码)[\s：:]*([0-9]{10,15})")
-SELLER_RE = re.compile(r"(?:销售方|卖方|开票人|开票机构)[\s：:]*(.{2,20})")
-BUYER_RE = re.compile(r"(?:购买方|买方|购方)[\s：:]*(.{2,20})")
-TAX_RE = re.compile(r"(?:税额|税|税率)[\s：:]*([0-9]+(?:\.[0-9]+)?)")
+INVOICE_NUMBER_RE = re.compile(r"(?:发票号码|发票号|号码|No\.?)[\s：:]*([A-Z0-9\-]{6,20})")
+INVOICE_CODE_RE = re.compile(r"(?:发票代码)[\s：:]*([0-9]{10,20})")
+SELLER_RE = re.compile(r"(?:销售方|卖方|销方|销方名称|开票人|开票机构|销售方名称)[\s：:]*(.{2,30})")
+BUYER_RE = re.compile(r"(?:购买方|买方|购方|购方名称|购买方名称)[\s：:]*(.{2,30})")
+TAX_RE = re.compile(r"(?:税额)[\s：:]*([0-9]+(?:\.[0-9]+)?)")
+
+AMOUNT_KEYWORDS = ("价税合计", "小写", "合计", "总计", "金额", "￥", "¥")
+AMOUNT_EXCLUDE_KEYWORDS = (
+    "发票代码", "发票号码", "发票号", "号码", "编号", "税号",
+    "纳税人识别号", "统一社会信用代码", "校验码", "机器编号", "序列号",
+    "税率", "%"
+)
+PARTY_TRAIL_KEYWORDS = (
+    "统一社会信用代码", "纳税人识别号", "税号", "地址", "电话", "开户行", "账号"
+)
 
 
 def _bbox_center(bbox):
@@ -216,22 +226,79 @@ def _bbox_height(bbox):
     return max(ys) - min(ys)
 
 
+def _extract_digits(text: str, min_len: int = 6, max_len: int = 20) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(r"\d{%d,%d}" % (min_len, max_len), text)
+    if m:
+        return m.group(0)
+    return None
+
+
+def _find_value_right(entries, idx: int, y_tol: float = 18.0, min_x_gap: float = 6.0):
+    if idx < 0 or idx >= len(entries):
+        return None
+    base = entries[idx]
+    bx, by = base['center']
+    candidates = []
+    for j, e in enumerate(entries):
+        if j == idx:
+            continue
+        ex, ey = e['center']
+        if ex <= bx + min_x_gap:
+            continue
+        if abs(ey - by) <= y_tol:
+            candidates.append((ex - bx, e))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
 def _parse_amount_from_text(text: str) -> Optional[float]:
     if not text:
         return None
-    m = AMOUNT_RE.search(text)
-    if m:
-        num = m.group(1)
-    else:
-        m2 = NUM_RE.search(text)
-        if m2:
-            num = m2.group(1)
-        else:
-            return None
+    num = _extract_amount_str(text)
+    if not num:
+        return None
     try:
         return float(num.replace(',', ''))
     except Exception:
         return None
+
+
+def _extract_amount_str(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = AMOUNT_RE.search(text)
+    if m:
+        return m.group(1)
+    m2 = NUM_RE.search(text)
+    if m2:
+        return m2.group(1)
+    return None
+
+
+def _is_amount_candidate(text: str, num_str: str) -> bool:
+    if not num_str:
+        return False
+    t = (text or "").replace(" ", "")
+    if any(k in t for k in AMOUNT_EXCLUDE_KEYWORDS):
+        return False
+    raw = num_str.replace(",", "")
+    if raw.isdigit() and len(raw) >= 10:
+        return False
+    return True
+
+
+def _clean_party_name(text: str) -> str:
+    if not text:
+        return text
+    t = text.strip()
+    for key in PARTY_TRAIL_KEYWORDS:
+        if key in t:
+            t = t.split(key, 1)[0].strip()
+    return t
 
 
 def extract_text(image_file, ocr=None, conf_threshold: float = 0.0) -> Dict[str, Any]:
@@ -296,9 +363,23 @@ def extract_text(image_file, ocr=None, conf_threshold: float = 0.0) -> Dict[str,
                 "开票机构": None,
                 "购方": None,
                 "税额": None,
-                "错误": "PDF 支持需要 pdf2image 库，请运行：pip install pdf2image"
+                "错误": "PDF 支持需要安装：pip install pdf2image（并确保系统已安装 poppler）"
             }
         except Exception as e:
+            err_msg = str(e)
+            if 'poppler' in err_msg.lower():
+                return {
+                    "文件名": filename,
+                    "识别商品名": None,
+                    "金额": 0,
+                    "日期": None,
+                    "发票号": None,
+                    "发票代码": None,
+                    "开票机构": None,
+                    "购方": None,
+                    "税额": None,
+                    "错误": "PDF 需要 poppler 系统依赖。Windows: 下载 poppler-bin 并添加到 PATH；Linux: sudo apt install poppler-utils；Mac: brew install poppler"
+                }
             logging.getLogger(__name__).exception('PDF 转换失败：%s', e)
             return {
                 "文件名": filename,
@@ -310,7 +391,7 @@ def extract_text(image_file, ocr=None, conf_threshold: float = 0.0) -> Dict[str,
                 "开票机构": None,
                 "购方": None,
                 "税额": None,
-                "错误": f"PDF 处理失败：{str(e)}"
+                "错误": f"PDF 处理失败：{err_msg}"
             }
     else:
         # 处理常规图片文件
@@ -415,22 +496,37 @@ def extract_text(image_file, ocr=None, conf_threshold: float = 0.0) -> Dict[str,
                 'height': _bbox_height(bbox),
             })
 
-        # 解析金额
+        # 解析金额（优先包含关键字，过滤发票代码/税号等长数字）
         found_amount = None
         amount_center = None
-        candidates = []
+        keyword_candidates = []
+        other_candidates = []
         for e in entries:
-            amt = _parse_amount_from_text(e['text'])
-            if amt is not None:
-                candidates.append((e, amt))
-                if re.search(r'金额|合计|总计|小计|¥|￥', e['text']):
-                    found_amount = amt
-                    amount_center = e['center']
-                    break
-        if found_amount is None and candidates:
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            found_amount = candidates[0][1]
-            amount_center = candidates[0][0]['center']
+            num_str = _extract_amount_str(e['text'])
+            if not num_str:
+                continue
+            if not _is_amount_candidate(e['text'], num_str):
+                continue
+            try:
+                amt = float(num_str.replace(',', ''))
+            except Exception:
+                continue
+            text_no_space = (e['text'] or '').replace(' ', '')
+            if any(k in text_no_space for k in AMOUNT_KEYWORDS):
+                priority = 2 if ('价税合计' in text_no_space or '小写' in text_no_space) else 1
+                keyword_candidates.append((priority, e, amt))
+            else:
+                other_candidates.append((e, amt))
+
+        if keyword_candidates:
+            keyword_candidates.sort(key=lambda x: (x[0], x[2]), reverse=True)
+            _, best_e, best_amt = keyword_candidates[0]
+            found_amount = best_amt
+            amount_center = best_e['center']
+        elif other_candidates:
+            other_candidates.sort(key=lambda x: x[1], reverse=True)
+            found_amount = other_candidates[0][1]
+            amount_center = other_candidates[0][0]['center']
 
         # 解析日期
         found_date = None
@@ -471,24 +567,50 @@ def extract_text(image_file, ocr=None, conf_threshold: float = 0.0) -> Dict[str,
         buyer = None
         tax_amount = None
         
-        for e in entries:
+        for idx, e in enumerate(entries):
             text = e['text']
+            text_nospace = (text or '').replace(' ', '')
+
             if not invoice_number:
                 m = INVOICE_NUMBER_RE.search(text)
                 if m:
                     invoice_number = m.group(1)
+                elif '发票号码' in text_nospace or '发票号' in text_nospace:
+                    right = _find_value_right(entries, idx)
+                    if right:
+                        digits = _extract_digits(right['text'], min_len=6, max_len=20)
+                        if digits:
+                            invoice_number = digits
+
             if not invoice_code:
                 m = INVOICE_CODE_RE.search(text)
                 if m:
                     invoice_code = m.group(1)
+                elif '发票代码' in text_nospace:
+                    right = _find_value_right(entries, idx)
+                    if right:
+                        digits = _extract_digits(right['text'], min_len=10, max_len=20)
+                        if digits:
+                            invoice_code = digits
+
             if not seller:
                 m = SELLER_RE.search(text)
                 if m:
-                    seller = m.group(1)
+                    seller = _clean_party_name(m.group(1))
+                elif any(k in text_nospace for k in ('销售方名称', '销售方', '卖方', '销方名称', '销方')):
+                    right = _find_value_right(entries, idx)
+                    if right:
+                        seller = _clean_party_name(right['text'])
+
             if not buyer:
                 m = BUYER_RE.search(text)
                 if m:
-                    buyer = m.group(1)
+                    buyer = _clean_party_name(m.group(1))
+                elif any(k in text_nospace for k in ('购买方名称', '购买方', '买方', '购方名称', '购方')):
+                    right = _find_value_right(entries, idx)
+                    if right:
+                        buyer = _clean_party_name(right['text'])
+
             if not tax_amount:
                 m = TAX_RE.search(text)
                 if m:
@@ -496,6 +618,15 @@ def extract_text(image_file, ocr=None, conf_threshold: float = 0.0) -> Dict[str,
                         tax_amount = float(m.group(1))
                     except Exception:
                         pass
+                elif '税额' in text_nospace:
+                    right = _find_value_right(entries, idx)
+                    if right:
+                        tax_val = _extract_amount_str(right['text'])
+                        if tax_val:
+                            try:
+                                tax_amount = float(tax_val.replace(',', ''))
+                            except Exception:
+                                pass
 
         out = {
             '文件名': filename,
